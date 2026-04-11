@@ -1,0 +1,601 @@
+# A1. Prompt Caching — Full Deep Dive
+
+> How Claude Code saves 86% on token costs using a 3-level caching system.
+> Study this to understand production-grade LLM cost optimization.
+
+---
+
+## Step 1: What is a Token?
+
+```
+Before text reaches Claude, it's broken into "tokens":
+
+  "Hello, how are you?" → ["Hello", ",", " how", " are", " you", "?"]
+                           = 6 tokens
+
+  RULE OF THUMB:
+    1 token ≈ 4 characters
+    1 token ≈ 0.75 words
+    100 words ≈ 130 tokens
+
+  "You are Claude Code, Anthropic's official CLI..."
+  This system prompt = ~15,000 tokens
+```
+
+---
+
+## Step 2: Why Does It Cost Money?
+
+```
+Claude API pricing (Opus model):
+
+  ┌──────────────────┬──────────────────┐
+  │ TYPE             │ COST per 1M      │
+  ├──────────────────┼──────────────────┤
+  │ Input tokens     │ $15.00           │  ← what you SEND
+  │ Output tokens    │ $75.00           │  ← what Claude REPLIES
+  │ CACHED input     │ $1.50            │  ← 90% cheaper!
+  └──────────────────┴──────────────────┘
+
+  The key insight:
+    Normal input = $15 per million
+    Cached input = $1.50 per million
+    = 90% discount if you cache
+```
+
+---
+
+## Step 3: The Problem
+
+```
+Every API call sends the FULL system prompt + FULL history:
+
+  Turn 1:  [system prompt 15K] + [your message 100]
+  Turn 2:  [system prompt 15K] + [turn 1 history 2K] + [your message 100]
+  Turn 3:  [system prompt 15K] + [turn 1-2 history 5K] + [your message 100]
+  ...
+  Turn 20: [system prompt 15K] + [history 50K] + [your message 100]
+
+  The system prompt is IDENTICAL every time.
+  15K tokens × 20 turns = 300K tokens = $4.50 WASTED
+
+  Why send "You are Claude Code..." 20 times?
+  Cache it. Send it once. Pay once.
+```
+
+---
+
+## Step 4: The Solution — Boundary Marker
+
+Claude Code splits its prompt into TWO halves using a marker string:
+
+```
+ACTUAL CODE: src/constants/prompts.ts (line 560-576)
+
+  return [
+    // ─── STATIC (same for ALL users, ALL sessions) ───
+    getSimpleIntroSection(),           // "You are Claude Code..."
+    getSimpleSystemSection(),          // permission rules
+    getSimpleDoingTasksSection(),      // code quality rules
+    getActionsSection(),               // safety rules
+    getUsingYourToolsSection(),        // tool usage rules
+    getSimpleToneAndStyleSection(),    // tone rules
+    getOutputEfficiencySection(),      // "be concise"
+
+    // ═══ THIS STRING SPLITS THE TWO HALVES ═══
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    //  = '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'
+
+    // ─── DYNAMIC (different per session) ───
+    ...resolvedDynamicSections,        // memory, env, MCP, etc.
+  ]
+
+
+WHY THIS MATTERS:
+  Everything ABOVE the boundary → same text for everyone on earth
+  Everything BELOW the boundary → different per user/session
+
+  Above = cache globally (all users share the cache)
+  Below = can't cache globally (personal data)
+```
+
+---
+
+## Step 5: How the API Receives It
+
+The function `splitSysPromptPrefix()` in `src/utils/api.ts` (line 321) takes the prompt array and splits it into blocks with cache instructions:
+
+```
+ACTUAL CODE: src/utils/api.ts (line 362-404)
+
+  Input: ["You are Claude Code...", "Rules...", ..., BOUNDARY, "Memory...", ...]
+
+  Output: [
+    {
+      text: "You are Claude Code...\n\nRules...\n\n...",
+      cacheScope: 'global'        ← cache for ALL users worldwide
+    },
+    {
+      text: "Memory...\n\nEnv info...\n\n...",
+      cacheScope: null             ← no caching (personal data)
+    }
+  ]
+
+
+HOW IT WORKS IN CODE:
+
+  const boundaryIndex = systemPrompt.findIndex(
+    s => s === SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+  )
+
+  for (let i = 0; i < systemPrompt.length; i++) {
+    const block = systemPrompt[i]
+
+    if (i < boundaryIndex) {
+      staticBlocks.push(block)      // before boundary → STATIC
+    } else {
+      dynamicBlocks.push(block)     // after boundary → DYNAMIC
+    }
+  }
+
+  // Static → cacheScope: 'global'
+  // Dynamic → cacheScope: null
+```
+
+---
+
+## Step 6: How cache_control Is Sent to API
+
+The function `buildSystemPromptBlocks()` in `src/services/api/claude.ts` (line 3213) converts blocks into the final API format:
+
+```
+ACTUAL CODE: src/services/api/claude.ts (line 3213-3237)
+
+  function buildSystemPromptBlocks(systemPrompt, enablePromptCaching) {
+    return splitSysPromptPrefix(systemPrompt).map(block => {
+      return {
+        type: 'text',
+        text: block.text,
+
+        // Add cache_control only if caching is enabled AND scope is set
+        ...(enablePromptCaching && block.cacheScope !== null && {
+          cache_control: getCacheControl({
+            scope: block.cacheScope,   // 'global' or 'org'
+          }),
+        }),
+      }
+    })
+  }
+
+
+WHAT GETS SENT TO THE API:
+
+  system: [
+    {
+      type: "text",
+      text: "You are Claude Code...[all static sections]...",
+      cache_control: {
+        type: "ephemeral",
+        scope: "global",     ← shared across ALL Claude Code users
+        ttl: "1h"            ← cache lives for 1 hour
+      }
+    },
+    {
+      type: "text",
+      text: "Memory...[all dynamic sections]..."
+      // NO cache_control → not cached
+    }
+  ]
+```
+
+---
+
+## Step 7: getCacheControl — The Cache Config
+
+```
+ACTUAL CODE: src/services/api/claude.ts (line 358-374)
+
+  function getCacheControl({ scope, querySource }) {
+    return {
+      type: 'ephemeral',                              // cache type
+      ...(should1hCacheTTL(querySource) && { ttl: '1h' }),  // 1 hour TTL
+      ...(scope === 'global' && { scope }),             // global = all users
+    }
+  }
+
+  Three cache scopes:
+  ┌──────────┬────────────────────────────────────────────┐
+  │ SCOPE    │ WHO SHARES THE CACHE                       │
+  ├──────────┼────────────────────────────────────────────┤
+  │ 'global' │ ALL Claude Code users worldwide            │
+  │ 'org'    │ Users in same organization                 │
+  │ null     │ No caching                                 │
+  └──────────┴────────────────────────────────────────────┘
+
+  TTL (Time To Live):
+    default  → 5 minutes
+    '1h'     → 1 hour (for longer sessions)
+```
+
+---
+
+## Step 8: Section Memoization — Dynamic Section Cache
+
+Dynamic sections can't be cached by the API (they contain personal data), but they CAN be computed once and reused in-memory:
+
+```
+ACTUAL CODE: src/constants/systemPromptSections.ts
+
+  ── TYPE DEFINITION ──
+
+  type SystemPromptSection = {
+    name: string            // unique identifier
+    compute: () => string   // function that generates the text
+    cacheBreak: boolean     // true = recompute every turn
+  }
+
+
+  ── TWO WAYS TO CREATE A SECTION ──
+
+  // WAY 1: Memoized (computed ONCE, cached until /clear)
+  function systemPromptSection(name, compute) {
+    return { name, compute, cacheBreak: false }
+  }
+
+  // WAY 2: Uncached (recomputed EVERY turn)
+  function DANGEROUS_uncachedSystemPromptSection(name, compute, reason) {
+    return { name, compute, cacheBreak: true }
+    //                                  ↑ this forces recomputation
+    //                       reason is REQUIRED ← forces developer to explain WHY
+  }
+
+
+  ── HOW THEY'RE USED ──
+  src/constants/prompts.ts (line 491-555)
+
+  const dynamicSections = [
+    // These compute ONCE and cache:
+    systemPromptSection('session_guidance', () => getSessionGuidance()),
+    systemPromptSection('memory',          () => loadMemoryPrompt()),
+    systemPromptSection('env_info',        () => computeEnvInfo()),
+    systemPromptSection('language',        () => getLanguageSection()),
+    systemPromptSection('output_style',    () => getOutputStyle()),
+    systemPromptSection('scratchpad',      () => getScratchpad()),
+
+    // This recomputes EVERY turn (MCP servers can disconnect):
+    DANGEROUS_uncachedSystemPromptSection(
+      'mcp_instructions',
+      () => getMcpInstructionsSection(),
+      'MCP servers connect/disconnect between turns'  ← reason explained
+    ),
+  ]
+```
+
+---
+
+## Step 9: The Resolver — How Cache Lookup Works
+
+```
+ACTUAL CODE: src/constants/systemPromptSections.ts (line 43-58)
+
+  async function resolveSystemPromptSections(sections) {
+    const cache = getSystemPromptSectionCache()   // Map<string, string>
+
+    return Promise.all(
+      sections.map(async (section) => {
+
+        // CHECK 1: Is it cached AND not cache-breaking?
+        if (!section.cacheBreak && cache.has(section.name)) {
+          return cache.get(section.name)   // ← INSTANT, no computation
+        }
+
+        // OTHERWISE: Compute the value
+        const value = await section.compute()   // ← may do I/O, file reads, etc.
+
+        // Save to cache for next turn
+        setSystemPromptSectionCacheEntry(section.name, value)
+
+        return value
+      }),
+    )
+  }
+
+
+  WHAT HAPPENS PER TURN:
+
+  Turn 1:
+    'memory'        → cache MISS → loadMemoryPrompt() → save to cache
+    'env_info'      → cache MISS → computeEnvInfo()   → save to cache
+    'mcp_instructions' → cacheBreak=true → ALWAYS recompute
+
+  Turn 2:
+    'memory'        → cache HIT → return instantly
+    'env_info'      → cache HIT → return instantly
+    'mcp_instructions' → cacheBreak=true → ALWAYS recompute
+
+  Turn 3-100: same as Turn 2
+```
+
+---
+
+## Step 10: Context Memoization — Compute Once Per Session
+
+```
+ACTUAL CODE: src/context.ts (line 116-189)
+
+  // getUserContext: computed ONCE, result stored forever in session
+
+  const getUserContext = memoize(async () => {
+    // Read CLAUDE.md files (walks directories, reads files)
+    const claudeMd = getClaudeMds(await getMemoryFiles())
+
+    return {
+      claudeMd,                                    // project instructions
+      currentDate: "Today's date is 2026-04-11",   // today's date
+    }
+  })
+  // ↑ memoize() means: run once, return cached result forever
+
+
+  // getSystemContext: computed ONCE, result stored forever in session
+
+  const getSystemContext = memoize(async () => {
+    // Run 5 git commands IN PARALLEL:
+    const [branch, mainBranch, status, log, userName] = await Promise.all([
+      getBranch(),                    // git branch --show-current
+      getDefaultBranch(),             // main or master
+      exec('git status --short'),     // modified files
+      exec('git log --oneline -5'),   // last 5 commits
+      exec('git config user.name'),   // your git name
+    ])
+
+    return {
+      gitStatus: `Branch: ${branch}\nStatus: ${status}\nCommits: ${log}`
+    }
+  })
+
+
+  WHAT HAPPENS:
+
+  Turn 1: getUserContext()
+    → reads CLAUDE.md files (~50ms)
+    → runs git commands (~200ms)
+    → saves result in memory
+    → returns result
+
+  Turn 2: getUserContext()
+    → returns cached result (~0ms)
+    → NO file reads, NO git commands
+
+  Turn 3-100: same as Turn 2 (~0ms each)
+
+  SAVINGS: 200ms × 99 turns = 19.8 seconds saved per session
+```
+
+---
+
+## Step 11: Cache Invalidation — When Caches Clear
+
+```
+ACTUAL CODE: src/constants/systemPromptSections.ts (line 65-68)
+
+  function clearSystemPromptSections() {
+    clearSystemPromptSectionState()    // clears the Map
+    clearBetaHeaderLatches()           // resets API flags
+  }
+
+
+  WHEN THIS IS CALLED:
+
+  ┌──────────────────┬─────────────────────────────────────────┐
+  │ EVENT            │ WHAT GETS CLEARED                       │
+  ├──────────────────┼─────────────────────────────────────────┤
+  │ Every turn       │ Nothing (use cache)                     │
+  │ /clear command   │ Section cache cleared, recompute next   │
+  │ /compact command │ Section cache cleared, recompute next   │
+  │ MCP change       │ Only mcp_instructions (cacheBreak=true) │
+  │ New session      │ Everything fresh (new Map, new memoize) │
+  │ App update       │ Global API cache miss (new hash)        │
+  └──────────────────┴─────────────────────────────────────────┘
+
+  RULE: Clear as LITTLE as possible.
+        More cache hits = less cost = faster response.
+```
+
+---
+
+## Step 12: Tool Schema Caching (Bonus)
+
+Not just the prompt — tool definitions are also cached:
+
+```
+ACTUAL CODE: src/utils/api.ts (line 119-208)
+
+  async function toolToAPISchema(tool) {
+    // Cache key = tool name (or name:schema for dynamic tools)
+    const cacheKey = tool.inputJSONSchema
+      ? `${tool.name}:${JSON.stringify(tool.inputJSONSchema)}`
+      : tool.name
+
+    const cache = getToolSchemaCache()
+
+    // Check cache first
+    let base = cache.get(cacheKey)
+    if (!base) {
+      // Cache miss: compute schema
+      base = {
+        name: tool.name,
+        description: await tool.prompt(),
+        input_schema: zodToJsonSchema(tool.inputSchema),
+      }
+      cache.set(cacheKey, base)   // save for next turn
+    }
+
+    return base   // cache hit: instant
+  }
+
+
+  WHY: 40+ tools × schema computation = expensive
+       Cache once, reuse every turn.
+       Also prevents mid-session schema drift from feature flag flips.
+```
+
+---
+
+## Step 13: The Complete Flow — All Layers Together
+
+```
+  YOU TYPE: "fix the bug"
+       │
+       ▼
+  QueryEngine.submitMessage()
+       │
+       │ ── LAYER 1: Context Memoization ──
+       │
+       ├── getUserContext()
+       │   Turn 1: read CLAUDE.md + date    (50ms)
+       │   Turn 2+: return cached           (0ms) ✓
+       │
+       ├── getSystemContext()
+       │   Turn 1: 5 git commands           (200ms)
+       │   Turn 2+: return cached           (0ms) ✓
+       │
+       │ ── LAYER 2: Section Memoization ──
+       │
+       ├── resolveSystemPromptSections()
+       │   ├── 'memory'     → Turn 1: compute. Turn 2+: cached ✓
+       │   ├── 'env_info'   → Turn 1: compute. Turn 2+: cached ✓
+       │   ├── 'language'   → Turn 1: compute. Turn 2+: cached ✓
+       │   └── 'mcp_instr'  → EVERY turn: recompute (volatile) ✗
+       │
+       │ ── LAYER 3: API Prompt Caching ──
+       │
+       ├── buildSystemPromptBlocks()
+       │   ├── Static sections → cache_control: {scope: 'global'} ✓
+       │   └── Dynamic sections → no cache_control ✗
+       │
+       │ ── LAYER 4: Tool Schema Caching ──
+       │
+       ├── toolToAPISchema() × 40 tools
+       │   Turn 1: compute all 40     (slow)
+       │   Turn 2+: return cached     (0ms) ✓
+       │
+       ▼
+  API CALL: system + messages + tools → Claude
+```
+
+---
+
+## Step 14: Cost Savings Breakdown
+
+```
+20-TURN CONVERSATION (realistic example):
+
+  System prompt: 15K tokens
+  Avg history:   30K tokens
+  Avg tools:     5K tokens
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                  WITHOUT CACHING                         │
+  ├──────────┬──────────┬──────────┬─────────┬──────────────┤
+  │ Turn     │ Prompt   │ History  │ Tools   │ Cost         │
+  │ 1        │ 15,000   │ 0        │ 5,000   │ $0.30        │
+  │ 2        │ 15,000   │ 3,000    │ 5,000   │ $0.35        │
+  │ 5        │ 15,000   │ 15,000   │ 5,000   │ $0.53        │
+  │ 10       │ 15,000   │ 35,000   │ 5,000   │ $0.83        │
+  │ 20       │ 15,000   │ 60,000   │ 5,000   │ $1.20        │
+  │ TOTAL    │ 300,000  │ 600,000  │ 100,000 │ $15.00       │
+  └──────────┴──────────┴──────────┴─────────┴──────────────┘
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                  WITH CACHING                            │
+  ├──────────┬──────────┬──────────┬─────────┬──────────────┤
+  │ Turn     │ Prompt   │ History  │ Tools   │ Cost         │
+  │ 1 (miss) │ 15,000   │ 0        │ 5,000   │ $0.30        │
+  │ 2 (hit)  │ 1,500*   │ 3,000    │ 500*    │ $0.07        │
+  │ 5 (hit)  │ 1,500*   │ 15,000   │ 500*    │ $0.25        │
+  │ 10 (hit) │ 1,500*   │ 35,000   │ 500*    │ $0.55        │
+  │ 20 (hit) │ 1,500*   │ 60,000   │ 500*    │ $0.93        │
+  │ TOTAL    │ 43,500   │ 600,000  │ 14,500  │ $9.87        │
+  └──────────┴──────────┴──────────┴─────────┴──────────────┘
+  * cached tokens charged at $1.50/1M instead of $15/1M
+
+  SAVINGS: $5.13 per conversation (34%)
+  (Prompt-only savings: 86%. Total savings lower because
+   history still grows and can't be cached this way.)
+```
+
+---
+
+## Step 15: The 4 Files That Make It Work
+
+```
+FILE 1: src/constants/prompts.ts
+  WHAT: Builds the prompt array with boundary marker
+  KEY LINES:
+    Line 114  → SYSTEM_PROMPT_DYNAMIC_BOUNDARY constant
+    Line 491  → dynamic sections with systemPromptSection()
+    Line 513  → DANGEROUS_uncachedSystemPromptSection()
+    Line 560  → final assembly: static + boundary + dynamic
+
+FILE 2: src/constants/systemPromptSections.ts
+  WHAT: Section cache layer (memoization)
+  KEY LINES:
+    Line 20   → systemPromptSection() — create cached section
+    Line 32   → DANGEROUS_uncachedSystemPromptSection() — volatile
+    Line 43   → resolveSystemPromptSections() — cache lookup + compute
+    Line 65   → clearSystemPromptSections() — invalidation
+
+FILE 3: src/utils/api.ts
+  WHAT: Splits prompt at boundary, assigns cache scopes
+  KEY LINES:
+    Line 80   → CacheScope type: 'global' | 'org'
+    Line 321  → splitSysPromptPrefix() — boundary splitting
+    Line 394  → static → cacheScope: 'global'
+    Line 396  → dynamic → cacheScope: null
+
+FILE 4: src/services/api/claude.ts
+  WHAT: Builds final API payload with cache_control
+  KEY LINES:
+    Line 358  → getCacheControl() — {type: 'ephemeral', scope, ttl}
+    Line 3213 → buildSystemPromptBlocks() — final text blocks
+    Line 3229 → attaches cache_control to static blocks
+```
+
+---
+
+## Step 16: What You Learned (AI Engineer Takeaways)
+
+```
+CONCEPT 1: Split your prompt at a boundary
+  Static text (same for everyone) → ABOVE boundary
+  Dynamic text (per-user/session) → BELOW boundary
+  The boundary is just a marker string
+
+CONCEPT 2: Use 3 cache levels
+  Level 1: API cache     → global/org scope, hash-based, 90% cost savings
+  Level 2: Session cache → in-memory Map, computed once per session
+  Level 3: No cache      → only for truly volatile data, DOCUMENT WHY
+
+CONCEPT 3: Memoize context computation
+  File reads, git commands, config loading → do once, store result
+  Use lodash memoize() or similar
+
+CONCEPT 4: Cache tool schemas too
+  Tool definitions are also tokens. Cache them.
+
+CONCEPT 5: Invalidate lazily
+  Don't clear caches on every turn
+  Only clear on explicit user actions (/clear, /compact)
+  Stale is OK for most things
+
+CONCEPT 6: Name your cache-breakers
+  DANGEROUS_uncachedSystemPromptSection(name, compute, REASON)
+  Force the developer to explain WHY caching can't be used
+  This prevents accidental cache-breaking
+
+CONCEPT 7: Parallel computation
+  getUserContext() and getSystemContext() run in parallel
+  5 git commands run in parallel
+  Use Promise.all() everywhere
+```
