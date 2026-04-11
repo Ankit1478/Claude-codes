@@ -1,4 +1,4 @@
-# 🧠 A1. Prompt Caching — Full Deep Dive
+# Prompt Caching — Full Deep Dive
 
 > **How Claude Code saves 86% on token costs using a 3-level caching system.**
 > Study this to understand production-grade LLM cost optimization.
